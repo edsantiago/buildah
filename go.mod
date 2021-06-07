@@ -15,7 +15,7 @@ require (
 	github.com/ghodss/yaml v1.0.0
 	github.com/hashicorp/go-multierror v1.1.1
 	github.com/ishidawataru/sctp v0.0.0-20210226210310-f2269e66cdee // indirect
-	github.com/mattn/go-shellwords v1.0.11
+	github.com/mattn/go-shellwords v1.0.12
 	github.com/onsi/ginkgo v1.16.2
 	github.com/onsi/gomega v1.12.0
 	github.com/opencontainers/go-digest v1.0.0
