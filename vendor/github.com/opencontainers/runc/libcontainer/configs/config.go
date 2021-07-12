@@ -31,9 +31,10 @@ type IDMap struct {
 // for syscalls. Additional architectures can be added by specifying them in
 // Architectures.
 type Seccomp struct {
-	DefaultAction Action     `json:"default_action"`
-	Architectures []string   `json:"architectures"`
-	Syscalls      []*Syscall `json:"syscalls"`
+	DefaultAction   Action     `json:"default_action"`
+	Architectures   []string   `json:"architectures"`
+	Syscalls        []*Syscall `json:"syscalls"`
+	DefaultErrnoRet *uint      `json:"default_errno_ret"`
 }
 
 // Action is taken upon rule match in Seccomp
@@ -207,9 +208,11 @@ type Config struct {
 	RootlessCgroups bool `json:"rootless_cgroups,omitempty"`
 }
 
-type HookName string
-type HookList []Hook
-type Hooks map[HookName]HookList
+type (
+	HookName string
+	HookList []Hook
+	Hooks    map[HookName]HookList
+)
 
 const (
 	// Prestart commands are executed after the container namespaces are created,
@@ -386,7 +389,7 @@ func (c Command) Run(s *specs.State) error {
 	case err := <-errC:
 		return err
 	case <-timerCh:
-		cmd.Process.Kill()
+		_ = cmd.Process.Kill()
 		<-errC
 		return fmt.Errorf("hook ran past specified timeout of %.1fs", c.Timeout.Seconds())
 	}
