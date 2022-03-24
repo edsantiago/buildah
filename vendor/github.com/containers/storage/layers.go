@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	drivers "github.com/containers/storage/drivers"
@@ -22,10 +23,12 @@ import (
 	"github.com/containers/storage/pkg/system"
 	"github.com/containers/storage/pkg/tarlog"
 	"github.com/containers/storage/pkg/truncindex"
+	multierror "github.com/hashicorp/go-multierror"
 	"github.com/klauspost/pgzip"
 	digest "github.com/opencontainers/go-digest"
 	"github.com/opencontainers/selinux/go-selinux/label"
 	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 	"github.com/vbatts/tar-split/archive/tar"
 	"github.com/vbatts/tar-split/tar/asm"
 	"github.com/vbatts/tar-split/tar/storage"
@@ -218,7 +221,16 @@ type LayerStore interface {
 
 	// SetNames replaces the list of names associated with a layer with the
 	// supplied values.
+	// Deprecated: Prone to race conditions, suggested alternatives are `AddNames` and `RemoveNames`.
 	SetNames(id string, names []string) error
+
+	// AddNames adds the supplied values to the list of names associated with the layer with the
+	// specified id.
+	AddNames(id string, names []string) error
+
+	// RemoveNames remove the supplied values from the list of names associated with the layer with the
+	// specified id.
+	RemoveNames(id string, names []string) error
 
 	// Delete deletes a layer with the specified name or ID.
 	Delete(id string) error
@@ -246,6 +258,19 @@ type LayerStore interface {
 	// applies its changes to a specified layer.
 	ApplyDiff(to string, diff io.Reader) (int64, error)
 
+	// ApplyDiffWithDiffer applies the changes through the differ callback function.
+	// If to is the empty string, then a staging directory is created by the driver.
+	ApplyDiffWithDiffer(to string, options *drivers.ApplyDiffOpts, differ drivers.Differ) (*drivers.DriverWithDifferOutput, error)
+
+	// CleanupStagingDirectory cleanups the staging directory.  It can be used to cleanup the staging directory on errors
+	CleanupStagingDirectory(stagingDirectory string) error
+
+	// ApplyDiffFromStagingDirectory uses stagingDirectory to create the diff.
+	ApplyDiffFromStagingDirectory(id, stagingDirectory string, diffOutput *drivers.DriverWithDifferOutput, options *drivers.ApplyDiffOpts) error
+
+	// DifferTarget gets the location where files are stored for the layer.
+	DifferTarget(id string) (string, error)
+
 	// LoadLocked wraps Load in a locked state. This means it loads the store
 	// and cleans-up invalid layers if needed.
 	LoadLocked() error
@@ -257,20 +282,22 @@ type LayerStore interface {
 }
 
 type layerStore struct {
-	lockfile          Locker
-	mountsLockfile    Locker
-	rundir            string
-	driver            drivers.Driver
-	layerdir          string
-	layers            []*Layer
-	idindex           *truncindex.TruncIndex
-	byid              map[string]*Layer
-	byname            map[string]*Layer
-	bymount           map[string]*Layer
-	bycompressedsum   map[digest.Digest][]string
-	byuncompressedsum map[digest.Digest][]string
-	uidMap            []idtools.IDMap
-	gidMap            []idtools.IDMap
+	lockfile           Locker
+	mountsLockfile     Locker
+	rundir             string
+	driver             drivers.Driver
+	layerdir           string
+	layers             []*Layer
+	idindex            *truncindex.TruncIndex
+	byid               map[string]*Layer
+	byname             map[string]*Layer
+	bymount            map[string]*Layer
+	bycompressedsum    map[digest.Digest][]string
+	byuncompressedsum  map[digest.Digest][]string
+	uidMap             []idtools.IDMap
+	gidMap             []idtools.IDMap
+	loadMut            sync.Mutex
+	layerspathModified time.Time
 }
 
 func copyLayer(l *Layer) *Layer {
@@ -381,14 +408,13 @@ func (r *layerStore) Load() error {
 				if layer.Flags == nil {
 					layer.Flags = make(map[string]interface{})
 				}
-				if cleanup, ok := layer.Flags[incompleteFlag]; ok {
-					if b, ok := cleanup.(bool); ok && b {
-						err = r.deleteInternal(layer.ID)
-						if err != nil {
-							break
-						}
-						shouldSave = true
+				if layerHasIncompleteFlag(layer) {
+					logrus.Warnf("Found incomplete layer %#v, deleting it", layer.ID)
+					err = r.deleteInternal(layer.ID)
+					if err != nil {
+						break
 					}
+					shouldSave = true
 				}
 			}
 		}
@@ -724,26 +750,17 @@ func (r *layerStore) Put(id string, parentLayer *Layer, names []string, mountLab
 	}
 	if moreOptions.TemplateLayer != "" {
 		if err = r.driver.CreateFromTemplate(id, moreOptions.TemplateLayer, templateIDMappings, parent, parentMappings, &opts, writeable); err != nil {
-			if id != "" {
-				return nil, -1, errors.Wrapf(err, "error creating copy of template layer %q with ID %q", moreOptions.TemplateLayer, id)
-			}
-			return nil, -1, errors.Wrapf(err, "error creating copy of template layer %q", moreOptions.TemplateLayer)
+			return nil, -1, errors.Wrapf(err, "error creating copy of template layer %q with ID %q", moreOptions.TemplateLayer, id)
 		}
 		oldMappings = templateIDMappings
 	} else {
 		if writeable {
 			if err = r.driver.CreateReadWrite(id, parent, &opts); err != nil {
-				if id != "" {
-					return nil, -1, errors.Wrapf(err, "error creating read-write layer with ID %q", id)
-				}
-				return nil, -1, errors.Wrapf(err, "error creating read-write layer")
+				return nil, -1, errors.Wrapf(err, "error creating read-write layer with ID %q", id)
 			}
 		} else {
 			if err = r.driver.Create(id, parent, &opts); err != nil {
-				if id != "" {
-					return nil, -1, errors.Wrapf(err, "error creating layer with ID %q", id)
-				}
-				return nil, -1, errors.Wrapf(err, "error creating layer")
+				return nil, -1, errors.Wrapf(err, "error creating layer with ID %q", id)
 			}
 		}
 		oldMappings = parentMappings
@@ -752,7 +769,9 @@ func (r *layerStore) Put(id string, parentLayer *Layer, names []string, mountLab
 		if err = r.driver.UpdateLayerIDMap(id, oldMappings, idMappings, mountLabel); err != nil {
 			// We don't have a record of this layer, but at least
 			// try to clean it up underneath us.
-			r.driver.Remove(id)
+			if err2 := r.driver.Remove(id); err2 != nil {
+				logrus.Errorf("While recovering from a failure creating in UpdateLayerIDMap, error deleting layer %#v: %v", id, err2)
+			}
 			return nil, -1, err
 		}
 	}
@@ -777,21 +796,26 @@ func (r *layerStore) Put(id string, parentLayer *Layer, names []string, mountLab
 		for flag, value := range flags {
 			layer.Flags[flag] = value
 		}
+		savedIncompleteLayer := false
 		if diff != nil {
 			layer.Flags[incompleteFlag] = true
 			err = r.Save()
 			if err != nil {
 				// We don't have a record of this layer, but at least
 				// try to clean it up underneath us.
-				r.driver.Remove(id)
+				if err2 := r.driver.Remove(id); err2 != nil {
+					logrus.Errorf("While recovering from a failure saving incomplete layer metadata, error deleting layer %#v: %v", id, err2)
+				}
 				return nil, -1, err
 			}
-			size, err = r.ApplyDiff(layer.ID, diff)
+			savedIncompleteLayer = true
+			size, err = r.applyDiffWithOptions(layer.ID, moreOptions, diff)
 			if err != nil {
-				if r.Delete(layer.ID) != nil {
+				if err2 := r.Delete(layer.ID); err2 != nil {
 					// Either a driver error or an error saving.
 					// We now have a layer that's been marked for
 					// deletion but which we failed to remove.
+					logrus.Errorf("While recovering from a failure applying layer diff, error deleting layer %#v: %v", layer.ID, err2)
 				}
 				return nil, -1, err
 			}
@@ -799,9 +823,20 @@ func (r *layerStore) Put(id string, parentLayer *Layer, names []string, mountLab
 		}
 		err = r.Save()
 		if err != nil {
-			// We don't have a record of this layer, but at least
-			// try to clean it up underneath us.
-			r.driver.Remove(id)
+			if savedIncompleteLayer {
+				if err2 := r.Delete(layer.ID); err2 != nil {
+					// Either a driver error or an error saving.
+					// We now have a layer that's been marked for
+					// deletion but which we failed to remove.
+					logrus.Errorf("While recovering from a failure saving finished layer metadata, error deleting layer %#v: %v", layer.ID, err2)
+				}
+			} else {
+				// We don't have a record of this layer, but at least
+				// try to clean it up underneath us.
+				if err2 := r.driver.Remove(id); err2 != nil {
+					logrus.Errorf("While recovering from a failure saving finished layer metadata, error deleting layer %#v in graph driver: %v", id, err2)
+				}
+			}
 			return nil, -1, err
 		}
 		layer = copyLayer(layer)
@@ -1014,25 +1049,43 @@ func (r *layerStore) removeName(layer *Layer, name string) {
 	layer.Names = stringSliceWithoutValue(layer.Names, name)
 }
 
+// Deprecated: Prone to race conditions, suggested alternatives are `AddNames` and `RemoveNames`.
 func (r *layerStore) SetNames(id string, names []string) error {
+	return r.updateNames(id, names, setNames)
+}
+
+func (r *layerStore) AddNames(id string, names []string) error {
+	return r.updateNames(id, names, addNames)
+}
+
+func (r *layerStore) RemoveNames(id string, names []string) error {
+	return r.updateNames(id, names, removeNames)
+}
+
+func (r *layerStore) updateNames(id string, names []string, op updateNameOperation) error {
 	if !r.IsReadWrite() {
 		return errors.Wrapf(ErrStoreIsReadOnly, "not allowed to change layer name assignments at %q", r.layerspath())
 	}
-	names = dedupeNames(names)
-	if layer, ok := r.lookup(id); ok {
-		for _, name := range layer.Names {
-			delete(r.byname, name)
-		}
-		for _, name := range names {
-			if otherLayer, ok := r.byname[name]; ok {
-				r.removeName(otherLayer, name)
-			}
-			r.byname[name] = layer
-		}
-		layer.Names = names
-		return r.Save()
+	layer, ok := r.lookup(id)
+	if !ok {
+		return ErrLayerUnknown
 	}
-	return ErrLayerUnknown
+	oldNames := layer.Names
+	names, err := applyNameOperation(oldNames, names, op)
+	if err != nil {
+		return err
+	}
+	for _, name := range oldNames {
+		delete(r.byname, name)
+	}
+	for _, name := range names {
+		if otherLayer, ok := r.byname[name]; ok {
+			r.removeName(otherLayer, name)
+		}
+		r.byname[name] = layer
+	}
+	layer.Names = names
+	return r.Save()
 }
 
 func (r *layerStore) datadir(id string) string {
@@ -1131,6 +1184,17 @@ func (r *layerStore) tspath(id string) string {
 	return filepath.Join(r.layerdir, id+tarSplitSuffix)
 }
 
+// layerHasIncompleteFlag returns true if layer.Flags contains an incompleteFlag set to true
+func layerHasIncompleteFlag(layer *Layer) bool {
+	// layer.Flags[…] is defined to succeed and return ok == false if Flags == nil
+	if flagValue, ok := layer.Flags[incompleteFlag]; ok {
+		if b, ok := flagValue.(bool); ok && b {
+			return true
+		}
+	}
+	return false
+}
+
 func (r *layerStore) deleteInternal(id string) error {
 	if !r.IsReadWrite() {
 		return errors.Wrapf(ErrStoreIsReadOnly, "not allowed to delete layers at %q", r.layerspath())
@@ -1139,50 +1203,65 @@ func (r *layerStore) deleteInternal(id string) error {
 	if !ok {
 		return ErrLayerUnknown
 	}
+	// Ensure that if we are interrupted, the layer will be cleaned up.
+	if !layerHasIncompleteFlag(layer) {
+		if layer.Flags == nil {
+			layer.Flags = make(map[string]interface{})
+		}
+		layer.Flags[incompleteFlag] = true
+		if err := r.Save(); err != nil {
+			return err
+		}
+	}
+	// We never unset incompleteFlag; below, we remove the entire object from r.layers.
+
 	id = layer.ID
 	err := r.driver.Remove(id)
-	if err == nil {
-		os.Remove(r.tspath(id))
-		os.RemoveAll(r.datadir(id))
-		delete(r.byid, id)
-		for _, name := range layer.Names {
-			delete(r.byname, name)
+	if err != nil {
+		return err
+	}
+
+	os.Remove(r.tspath(id))
+	os.RemoveAll(r.datadir(id))
+	delete(r.byid, id)
+	for _, name := range layer.Names {
+		delete(r.byname, name)
+	}
+	r.idindex.Delete(id)
+	mountLabel := layer.MountLabel
+	if layer.MountPoint != "" {
+		delete(r.bymount, layer.MountPoint)
+	}
+	r.deleteInDigestMap(id)
+	toDeleteIndex := -1
+	for i, candidate := range r.layers {
+		if candidate.ID == id {
+			toDeleteIndex = i
+			break
 		}
-		r.idindex.Delete(id)
-		mountLabel := layer.MountLabel
-		if layer.MountPoint != "" {
-			delete(r.bymount, layer.MountPoint)
+	}
+	if toDeleteIndex != -1 {
+		// delete the layer at toDeleteIndex
+		if toDeleteIndex == len(r.layers)-1 {
+			r.layers = r.layers[:len(r.layers)-1]
+		} else {
+			r.layers = append(r.layers[:toDeleteIndex], r.layers[toDeleteIndex+1:]...)
 		}
-		r.deleteInDigestMap(id)
-		toDeleteIndex := -1
-		for i, candidate := range r.layers {
-			if candidate.ID == id {
-				toDeleteIndex = i
+	}
+	if mountLabel != "" {
+		var found bool
+		for _, candidate := range r.layers {
+			if candidate.MountLabel == mountLabel {
+				found = true
 				break
 			}
 		}
-		if toDeleteIndex != -1 {
-			// delete the layer at toDeleteIndex
-			if toDeleteIndex == len(r.layers)-1 {
-				r.layers = r.layers[:len(r.layers)-1]
-			} else {
-				r.layers = append(r.layers[:toDeleteIndex], r.layers[toDeleteIndex+1:]...)
-			}
-		}
-		if mountLabel != "" {
-			var found bool
-			for _, candidate := range r.layers {
-				if candidate.MountLabel == mountLabel {
-					found = true
-					break
-				}
-			}
-			if !found {
-				label.ReleaseLabel(mountLabel)
-			}
+		if !found {
+			label.ReleaseLabel(mountLabel)
 		}
 	}
-	return err
+
+	return nil
 }
 
 func (r *layerStore) deleteInDigestMap(id string) {
@@ -1386,6 +1465,52 @@ func (r *layerStore) Diff(from, to string, options *DiffOptions) (io.ReadCloser,
 		return maybeCompressReadCloser(diff)
 	}
 
+	if ad, ok := r.driver.(drivers.AdditionalLayerStoreDriver); ok {
+		if aLayer, err := ad.LookupAdditionalLayerByID(to); err == nil {
+			// This is an additional layer. We leverage blob API for acquiring the reproduced raw blob.
+			info, err := aLayer.Info()
+			if err != nil {
+				aLayer.Release()
+				return nil, err
+			}
+			defer info.Close()
+			layer := &Layer{}
+			if err := json.NewDecoder(info).Decode(layer); err != nil {
+				aLayer.Release()
+				return nil, err
+			}
+			blob, err := aLayer.Blob()
+			if err != nil {
+				aLayer.Release()
+				return nil, err
+			}
+			// If layer compression type is different from the expected one, decompress and convert it.
+			if compression != layer.CompressionType {
+				diff, err := archive.DecompressStream(blob)
+				if err != nil {
+					if err2 := blob.Close(); err2 != nil {
+						err = errors.Wrapf(err, "failed to close blob file: %v", err2)
+					}
+					aLayer.Release()
+					return nil, err
+				}
+				rc, err := maybeCompressReadCloser(diff)
+				if err != nil {
+					if err2 := closeAll(blob.Close, diff.Close); err2 != nil {
+						err = errors.Wrapf(err, "failed to cleanup: %v", err2)
+					}
+					aLayer.Release()
+					return nil, err
+				}
+				return ioutils.NewReadCloserWrapper(rc, func() error {
+					defer aLayer.Release()
+					return closeAll(blob.Close, rc.Close)
+				}), nil
+			}
+			return ioutils.NewReadCloserWrapper(blob, func() error { defer aLayer.Release(); return blob.Close() }), nil
+		}
+	}
+
 	tsfile, err := os.Open(r.tspath(to))
 	if err != nil {
 		if !os.IsNotExist(err) {
@@ -1397,34 +1522,48 @@ func (r *layerStore) Diff(from, to string, options *DiffOptions) (io.ReadCloser,
 		}
 		return maybeCompressReadCloser(diff)
 	}
-	defer tsfile.Close()
 
 	decompressor, err := pgzip.NewReader(tsfile)
 	if err != nil {
-		return nil, err
-	}
-	defer decompressor.Close()
-
-	tsbytes, err := ioutil.ReadAll(decompressor)
-	if err != nil {
+		if e := tsfile.Close(); e != nil {
+			logrus.Debug(e)
+		}
 		return nil, err
 	}
 
-	metadata = storage.NewJSONUnpacker(bytes.NewBuffer(tsbytes))
+	metadata = storage.NewJSONUnpacker(decompressor)
 
 	fgetter, err := r.newFileGetter(to)
 	if err != nil {
-		return nil, err
+		errs := multierror.Append(nil, errors.Wrapf(err, "creating file-getter"))
+		if err := decompressor.Close(); err != nil {
+			errs = multierror.Append(errs, errors.Wrapf(err, "closing decompressor"))
+		}
+		if err := tsfile.Close(); err != nil {
+			errs = multierror.Append(errs, errors.Wrapf(err, "closing tarstream headers"))
+		}
+		return nil, errs.ErrorOrNil()
 	}
 
 	tarstream := asm.NewOutputTarStream(fgetter, metadata)
 	rc := ioutils.NewReadCloserWrapper(tarstream, func() error {
-		err1 := tarstream.Close()
-		err2 := fgetter.Close()
-		if err2 == nil {
-			return err1
+		var errs *multierror.Error
+		if err := decompressor.Close(); err != nil {
+			errs = multierror.Append(errs, errors.Wrapf(err, "closing decompressor"))
 		}
-		return err2
+		if err := tsfile.Close(); err != nil {
+			errs = multierror.Append(errs, errors.Wrapf(err, "closing tarstream headers"))
+		}
+		if err := tarstream.Close(); err != nil {
+			errs = multierror.Append(errs, errors.Wrapf(err, "closing reconstructed tarstream"))
+		}
+		if err := fgetter.Close(); err != nil {
+			errs = multierror.Append(errs, errors.Wrapf(err, "closing file-getter"))
+		}
+		if errs != nil {
+			return errs.ErrorOrNil()
+		}
+		return nil
 	})
 	return maybeCompressReadCloser(rc)
 }
@@ -1439,6 +1578,10 @@ func (r *layerStore) DiffSize(from, to string) (size int64, err error) {
 }
 
 func (r *layerStore) ApplyDiff(to string, diff io.Reader) (size int64, err error) {
+	return r.applyDiffWithOptions(to, nil, diff)
+}
+
+func (r *layerStore) applyDiffWithOptions(to string, layerOptions *LayerOptions, diff io.Reader) (size int64, err error) {
 	if !r.IsReadWrite() {
 		return -1, errors.Wrapf(ErrStoreIsReadOnly, "not allowed to modify layer contents at %q", r.layerspath())
 	}
@@ -1453,16 +1596,41 @@ func (r *layerStore) ApplyDiff(to string, diff io.Reader) (size int64, err error
 	if err != nil && err != io.EOF {
 		return -1, err
 	}
-
 	compression := archive.DetectCompression(header[:n])
-	compressedDigest := digest.Canonical.Digester()
-	compressedCounter := ioutils.NewWriteCounter(compressedDigest.Hash())
-	defragmented := io.TeeReader(io.MultiReader(bytes.NewBuffer(header[:n]), diff), compressedCounter)
+	defragmented := io.MultiReader(bytes.NewBuffer(header[:n]), diff)
+
+	// Decide if we need to compute digests
+	var compressedDigest, uncompressedDigest digest.Digest       // = ""
+	var compressedDigester, uncompressedDigester digest.Digester // = nil
+	if layerOptions != nil && layerOptions.OriginalDigest != "" &&
+		layerOptions.OriginalDigest.Algorithm() == digest.Canonical {
+		compressedDigest = layerOptions.OriginalDigest
+	} else {
+		compressedDigester = digest.Canonical.Digester()
+	}
+	if layerOptions != nil && layerOptions.UncompressedDigest != "" &&
+		layerOptions.UncompressedDigest.Algorithm() == digest.Canonical {
+		uncompressedDigest = layerOptions.UncompressedDigest
+	} else {
+		uncompressedDigester = digest.Canonical.Digester()
+	}
+
+	var compressedWriter io.Writer
+	if compressedDigester != nil {
+		compressedWriter = compressedDigester.Hash()
+	} else {
+		compressedWriter = ioutil.Discard
+	}
+	compressedCounter := ioutils.NewWriteCounter(compressedWriter)
+	defragmented = io.TeeReader(defragmented, compressedCounter)
 
 	tsdata := bytes.Buffer{}
 	compressor, err := pgzip.NewWriterLevel(&tsdata, pgzip.BestSpeed)
 	if err != nil {
 		compressor = pgzip.NewWriter(&tsdata)
+	}
+	if err := compressor.SetConcurrency(1024*1024, 1); err != nil { // 1024*1024 is the hard-coded default; we're not changing that
+		logrus.Infof("Error setting compression concurrency threads to 1: %v; ignoring", err)
 	}
 	metadata := storage.NewJSONPacker(compressor)
 	uncompressed, err := archive.DecompressStream(defragmented)
@@ -1470,8 +1638,6 @@ func (r *layerStore) ApplyDiff(to string, diff io.Reader) (size int64, err error
 		return -1, err
 	}
 	defer uncompressed.Close()
-	uncompressedDigest := digest.Canonical.Digester()
-	uncompressedCounter := ioutils.NewWriteCounter(uncompressedDigest.Hash())
 	uidLog := make(map[uint32]struct{})
 	gidLog := make(map[uint32]struct{})
 	idLogger, err := tarlog.NewLogger(func(h *tar.Header) {
@@ -1484,7 +1650,12 @@ func (r *layerStore) ApplyDiff(to string, diff io.Reader) (size int64, err error
 		return -1, err
 	}
 	defer idLogger.Close()
-	payload, err := asm.NewInputTarStream(io.TeeReader(uncompressed, io.MultiWriter(uncompressedCounter, idLogger)), metadata, storage.NewDiscardFilePutter())
+	uncompressedCounter := ioutils.NewWriteCounter(idLogger)
+	uncompressedWriter := (io.Writer)(uncompressedCounter)
+	if uncompressedDigester != nil {
+		uncompressedWriter = io.MultiWriter(uncompressedWriter, uncompressedDigester.Hash())
+	}
+	payload, err := asm.NewInputTarStream(io.TeeReader(uncompressed, uncompressedWriter), metadata, storage.NewDiscardFilePutter())
 	if err != nil {
 		return -1, err
 	}
@@ -1506,6 +1677,12 @@ func (r *layerStore) ApplyDiff(to string, diff io.Reader) (size int64, err error
 			return -1, err
 		}
 	}
+	if compressedDigester != nil {
+		compressedDigest = compressedDigester.Digest()
+	}
+	if uncompressedDigester != nil {
+		uncompressedDigest = uncompressedDigester.Digest()
+	}
 
 	updateDigestMap := func(m *map[digest.Digest][]string, oldvalue, newvalue digest.Digest, id string) {
 		var newList []string
@@ -1525,11 +1702,11 @@ func (r *layerStore) ApplyDiff(to string, diff io.Reader) (size int64, err error
 			(*m)[newvalue] = append((*m)[newvalue], id)
 		}
 	}
-	updateDigestMap(&r.bycompressedsum, layer.CompressedDigest, compressedDigest.Digest(), layer.ID)
-	layer.CompressedDigest = compressedDigest.Digest()
+	updateDigestMap(&r.bycompressedsum, layer.CompressedDigest, compressedDigest, layer.ID)
+	layer.CompressedDigest = compressedDigest
 	layer.CompressedSize = compressedCounter.Count
-	updateDigestMap(&r.byuncompressedsum, layer.UncompressedDigest, uncompressedDigest.Digest(), layer.ID)
-	layer.UncompressedDigest = uncompressedDigest.Digest()
+	updateDigestMap(&r.byuncompressedsum, layer.UncompressedDigest, uncompressedDigest, layer.ID)
+	layer.UncompressedDigest = uncompressedDigest
 	layer.UncompressedSize = uncompressedCounter.Count
 	layer.CompressionType = compression
 	layer.UIDs = make([]uint32, 0, len(uidLog))
@@ -1550,6 +1727,93 @@ func (r *layerStore) ApplyDiff(to string, diff io.Reader) (size int64, err error
 	err = r.Save()
 
 	return size, err
+}
+
+func (r *layerStore) DifferTarget(id string) (string, error) {
+	ddriver, ok := r.driver.(drivers.DriverWithDiffer)
+	if !ok {
+		return "", ErrNotSupported
+	}
+	layer, ok := r.lookup(id)
+	if !ok {
+		return "", ErrLayerUnknown
+	}
+	return ddriver.DifferTarget(layer.ID)
+}
+
+func (r *layerStore) ApplyDiffFromStagingDirectory(id, stagingDirectory string, diffOutput *drivers.DriverWithDifferOutput, options *drivers.ApplyDiffOpts) error {
+	ddriver, ok := r.driver.(drivers.DriverWithDiffer)
+	if !ok {
+		return ErrNotSupported
+	}
+	layer, ok := r.lookup(id)
+	if !ok {
+		return ErrLayerUnknown
+	}
+	if options == nil {
+		options = &drivers.ApplyDiffOpts{
+			Mappings:   r.layerMappings(layer),
+			MountLabel: layer.MountLabel,
+		}
+	}
+	err := ddriver.ApplyDiffFromStagingDirectory(layer.ID, layer.Parent, stagingDirectory, diffOutput, options)
+	if err != nil {
+		return err
+	}
+	layer.UIDs = diffOutput.UIDs
+	layer.GIDs = diffOutput.GIDs
+	layer.UncompressedDigest = diffOutput.UncompressedDigest
+	layer.UncompressedSize = diffOutput.Size
+	layer.Metadata = diffOutput.Metadata
+	if err = r.Save(); err != nil {
+		return err
+	}
+	for k, v := range diffOutput.BigData {
+		if err := r.SetBigData(id, k, bytes.NewReader(v)); err != nil {
+			r.Delete(id)
+			return err
+		}
+	}
+	return err
+}
+
+func (r *layerStore) ApplyDiffWithDiffer(to string, options *drivers.ApplyDiffOpts, differ drivers.Differ) (*drivers.DriverWithDifferOutput, error) {
+	ddriver, ok := r.driver.(drivers.DriverWithDiffer)
+	if !ok {
+		return nil, ErrNotSupported
+	}
+
+	if to == "" {
+		output, err := ddriver.ApplyDiffWithDiffer("", "", options, differ)
+		return &output, err
+	}
+
+	layer, ok := r.lookup(to)
+	if !ok {
+		return nil, ErrLayerUnknown
+	}
+	if options == nil {
+		options = &drivers.ApplyDiffOpts{
+			Mappings:   r.layerMappings(layer),
+			MountLabel: layer.MountLabel,
+		}
+	}
+	output, err := ddriver.ApplyDiffWithDiffer(layer.ID, layer.Parent, options, differ)
+	if err != nil {
+		return nil, err
+	}
+	layer.UIDs = output.UIDs
+	layer.GIDs = output.GIDs
+	err = r.Save()
+	return &output, err
+}
+
+func (r *layerStore) CleanupStagingDirectory(stagingDirectory string) error {
+	ddriver, ok := r.driver.(drivers.DriverWithDiffer)
+	if !ok {
+		return ErrNotSupported
+	}
+	return ddriver.CleanupStagingDirectory(stagingDirectory)
 }
 
 func (r *layerStore) layersByDigestMap(m map[digest.Digest][]string, d digest.Digest) ([]Layer, error) {
@@ -1593,7 +1857,7 @@ func (r *layerStore) Touch() error {
 }
 
 func (r *layerStore) Modified() (bool, error) {
-	var mmodified bool
+	var mmodified, tmodified bool
 	lmodified, err := r.lockfile.Modified()
 	if err != nil {
 		return lmodified, err
@@ -1606,7 +1870,23 @@ func (r *layerStore) Modified() (bool, error) {
 			return lmodified, err
 		}
 	}
-	return lmodified || mmodified, nil
+
+	if lmodified || mmodified {
+		return true, nil
+	}
+
+	// If the layers.json file has been modified manually, then we have to
+	// reload the storage in any case.
+	info, err := os.Stat(r.layerspath())
+	if err != nil && !os.IsNotExist(err) {
+		return false, errors.Wrap(err, "stat layers file")
+	}
+	if info != nil {
+		tmodified = info.ModTime() != r.layerspathModified
+		r.layerspathModified = info.ModTime()
+	}
+
+	return tmodified, nil
 }
 
 func (r *layerStore) IsReadWrite() bool {
@@ -1619,4 +1899,28 @@ func (r *layerStore) TouchedSince(when time.Time) bool {
 
 func (r *layerStore) Locked() bool {
 	return r.lockfile.Locked()
+}
+
+func (r *layerStore) ReloadIfChanged() error {
+	r.loadMut.Lock()
+	defer r.loadMut.Unlock()
+
+	modified, err := r.Modified()
+	if err == nil && modified {
+		return r.Load()
+	}
+	return err
+}
+
+func closeAll(closes ...func() error) (rErr error) {
+	for _, f := range closes {
+		if err := f(); err != nil {
+			if rErr == nil {
+				rErr = errors.Wrapf(err, "close error")
+				continue
+			}
+			rErr = errors.Wrapf(rErr, "%v", err)
+		}
+	}
+	return
 }

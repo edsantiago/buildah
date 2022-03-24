@@ -53,4 +53,8 @@ var (
 	ErrSizeUnknown = errors.New("size is not known")
 	// ErrStoreIsReadOnly is returned when the caller makes a call to a read-only store that would require modifying its contents.
 	ErrStoreIsReadOnly = errors.New("called a write method on a read-only store")
+	// ErrNotSupported is returned when the requested functionality is not supported.
+	ErrNotSupported = errors.New("not supported")
+	// ErrInvalidMappings is returned when the specified mappings are invalid.
+	ErrInvalidMappings = errors.New("invalid mappings specified")
 )
