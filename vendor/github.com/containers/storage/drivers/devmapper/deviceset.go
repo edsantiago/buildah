@@ -1,3 +1,4 @@
+//go:build linux && cgo
 // +build linux,cgo
 
 package devmapper
@@ -6,6 +7,7 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"io/fs"
 	"io/ioutil"
 	"os"
 	"os/exec"
@@ -419,40 +421,35 @@ func (devices *DeviceSet) constructDeviceIDMap() {
 	}
 }
 
-func (devices *DeviceSet) deviceFileWalkFunction(path string, finfo os.FileInfo) error {
+func (devices *DeviceSet) deviceFileWalkFunction(path string, name string) error {
 
 	// Skip some of the meta files which are not device files.
-	if strings.HasSuffix(finfo.Name(), ".migrated") {
+	if strings.HasSuffix(name, ".migrated") {
 		logrus.Debugf("devmapper: Skipping file %s", path)
 		return nil
 	}
 
-	if strings.HasPrefix(finfo.Name(), ".") {
+	if strings.HasPrefix(name, ".") {
 		logrus.Debugf("devmapper: Skipping file %s", path)
 		return nil
 	}
 
-	if finfo.Name() == deviceSetMetaFile {
+	if name == deviceSetMetaFile {
 		logrus.Debugf("devmapper: Skipping file %s", path)
 		return nil
 	}
 
-	if finfo.Name() == transactionMetaFile {
+	if name == transactionMetaFile {
 		logrus.Debugf("devmapper: Skipping file %s", path)
 		return nil
 	}
 
 	logrus.Debugf("devmapper: Loading data for file %s", path)
 
-	hash := finfo.Name()
-	if hash == base {
-		hash = ""
-	}
-
 	// Include deleted devices also as cleanup delete device logic
 	// will go through it and see if there are any deleted devices.
-	if _, err := devices.lookupDevice(hash); err != nil {
-		return fmt.Errorf("devmapper: Error looking up device %s:%v", hash, err)
+	if _, err := devices.lookupDevice(name); err != nil {
+		return fmt.Errorf("devmapper: Error looking up device %s:%v", name, err)
 	}
 
 	return nil
@@ -462,21 +459,21 @@ func (devices *DeviceSet) loadDeviceFilesOnStart() error {
 	logrus.Debug("devmapper: loadDeviceFilesOnStart()")
 	defer logrus.Debug("devmapper: loadDeviceFilesOnStart() END")
 
-	var scan = func(path string, info os.FileInfo, err error) error {
+	var scan = func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			logrus.Debugf("devmapper: Can't walk the file %s", path)
 			return nil
 		}
 
 		// Skip any directories
-		if info.IsDir() {
+		if d.IsDir() {
 			return nil
 		}
 
-		return devices.deviceFileWalkFunction(path, info)
+		return devices.deviceFileWalkFunction(path, d.Name())
 	}
 
-	return filepath.Walk(devices.metadataDir(), scan)
+	return filepath.WalkDir(devices.metadataDir(), scan)
 }
 
 // Should be called with devices.Lock() held.
@@ -2010,14 +2007,7 @@ func (devices *DeviceSet) markForDeferredDeletion(info *devInfo) error {
 }
 
 // Should be called with devices.Lock() held.
-func (devices *DeviceSet) deleteTransaction(info *devInfo, syncDelete bool) error {
-	if err := devices.openTransaction(info.Hash, info.DeviceID); err != nil {
-		logrus.Debugf("devmapper: Error opening transaction hash = %s deviceId = %d", "", info.DeviceID)
-		return err
-	}
-
-	defer devices.closeTransaction()
-
+func (devices *DeviceSet) deleteDeviceNoLock(info *devInfo, syncDelete bool) error {
 	err := devicemapper.DeleteDevice(devices.getPoolDevName(), info.DeviceID)
 	if err != nil {
 		// If syncDelete is true, we want to return error. If deferred
@@ -2080,6 +2070,13 @@ func (devices *DeviceSet) issueDiscard(info *devInfo) error {
 
 // Should be called with devices.Lock() held.
 func (devices *DeviceSet) deleteDevice(info *devInfo, syncDelete bool) error {
+	if err := devices.openTransaction(info.Hash, info.DeviceID); err != nil {
+		logrus.WithField("storage-driver", "devicemapper").Debugf("Error opening transaction hash = %s deviceId = %d", info.Hash, info.DeviceID)
+		return err
+	}
+
+	defer devices.closeTransaction()
+
 	if devices.doBlkDiscard {
 		devices.issueDiscard(info)
 	}
@@ -2099,7 +2096,7 @@ func (devices *DeviceSet) deleteDevice(info *devInfo, syncDelete bool) error {
 		return err
 	}
 
-	if err := devices.deleteTransaction(info, syncDelete); err != nil {
+	if err := devices.deleteDeviceNoLock(info, syncDelete); err != nil {
 		return err
 	}
 
@@ -2229,7 +2226,7 @@ func (devices *DeviceSet) cancelDeferredRemovalIfNeeded(info *devInfo) error {
 	// Cancel deferred remove
 	if err := devices.cancelDeferredRemoval(info); err != nil {
 		// If Error is ErrEnxio. Device is probably already gone. Continue.
-		if errors.Cause(err) != devicemapper.ErrBusy {
+		if errors.Cause(err) != devicemapper.ErrEnxio {
 			return err
 		}
 	}
@@ -2446,7 +2443,9 @@ func (devices *DeviceSet) UnmountDevice(hash, mountPath string) error {
 
 	logrus.Debugf("devmapper: Unmount(%s)", mountPath)
 	if err := mount.Unmount(mountPath); err != nil {
-		return err
+		if ok, _ := Mounted(mountPath); ok {
+			return err
+		}
 	}
 	logrus.Debug("devmapper: Unmount done")
 
