@@ -36,7 +36,7 @@ func (o overlayWhiteoutConverter) ConvertWrite(hdr *tar.Header, path string, fi 
 		// we just rename the file and make it normal
 		dir, filename := filepath.Split(hdr.Name)
 		hdr.Name = filepath.Join(dir, WhiteoutPrefix+filename)
-		hdr.Mode = 0600
+		hdr.Mode = 0
 		hdr.Typeflag = tar.TypeReg
 		hdr.Size = 0
 	}
@@ -129,6 +129,17 @@ func (overlayWhiteoutConverter) ConvertReadWithHandler(hdr *tar.Header, path str
 		originalPath := filepath.Join(dir, originalBase)
 
 		if err := handler.Mknod(originalPath, unix.S_IFCHR, 0); err != nil {
+			// If someone does:
+			//     rm -rf /foo/bar
+			// in an image, some tools will generate a layer with:
+			//     /.wh.foo
+			//     /foo/.wh.bar
+			// and when doing the second mknod(), we will fail with
+			// ENOTDIR, since the previous /foo was mknod()'d as a
+			// character device node and not a directory.
+			if isENOTDIR(err) {
+				return false, nil
+			}
 			return false, err
 		}
 		if err := handler.Chown(originalPath, hdr.Uid, hdr.Gid); err != nil {
