@@ -1,6 +1,8 @@
 package storage
 
 import (
+	"errors"
+
 	"github.com/containers/storage/types"
 )
 
@@ -53,4 +55,11 @@ var (
 	ErrSizeUnknown = types.ErrSizeUnknown
 	// ErrStoreIsReadOnly is returned when the caller makes a call to a read-only store that would require modifying its contents.
 	ErrStoreIsReadOnly = types.ErrStoreIsReadOnly
+	// ErrNotSupported is returned when the requested functionality is not supported.
+	ErrNotSupported = types.ErrNotSupported
+	// ErrInvalidMappings is returned when the specified mappings are invalid.
+	ErrInvalidMappings = types.ErrInvalidMappings
+	// ErrInvalidNameOperation is returned when updateName is called with invalid operation.
+	// Internal error
+	errInvalidUpdateNameOperation = errors.New("invalid update name operation")
 )
