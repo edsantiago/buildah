@@ -1,13 +1,13 @@
 package graphdriver
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/vbatts/tar-split/tar/storage"
 
@@ -48,7 +48,7 @@ type CreateOpts struct {
 	ignoreChownErrors bool
 }
 
-// MountOpts contains optional arguments for LayerStope.Mount() methods.
+// MountOpts contains optional arguments for Driver.Get() methods.
 type MountOpts struct {
 	// Mount label is the MAC Labels to assign to mount point (SELINUX)
 	MountLabel string
@@ -60,6 +60,9 @@ type MountOpts struct {
 	// Volatile specifies whether the container storage can be optimized
 	// at the cost of not syncing all the dirty files in memory.
 	Volatile bool
+
+	// DisableShifting forces the driver to not do any ID shifting at runtime.
+	DisableShifting bool
 }
 
 // ApplyDiffOpts contains optional arguments for ApplyDiff methods.
@@ -167,6 +170,40 @@ type Driver interface {
 	LayerIDMapUpdater
 }
 
+// DriverWithDifferOutput is the result of ApplyDiffWithDiffer
+// This API is experimental and can be changed without bumping the major version number.
+type DriverWithDifferOutput struct {
+	Differ             Differ
+	Target             string
+	Size               int64
+	UIDs               []uint32
+	GIDs               []uint32
+	UncompressedDigest digest.Digest
+	Metadata           string
+	BigData            map[string][]byte
+}
+
+// Differ defines the interface for using a custom differ.
+// This API is experimental and can be changed without bumping the major version number.
+type Differ interface {
+	ApplyDiff(dest string, options *archive.TarOptions) (DriverWithDifferOutput, error)
+}
+
+// DriverWithDiffer is the interface for direct diff access.
+// This API is experimental and can be changed without bumping the major version number.
+type DriverWithDiffer interface {
+	Driver
+	// ApplyDiffWithDiffer applies the changes using the callback function.
+	// If id is empty, then a staging directory is created.  The staging directory is guaranteed to be usable with ApplyDiffFromStagingDirectory.
+	ApplyDiffWithDiffer(id, parent string, options *ApplyDiffOpts, differ Differ) (output DriverWithDifferOutput, err error)
+	// ApplyDiffFromStagingDirectory applies the changes using the specified staging directory.
+	ApplyDiffFromStagingDirectory(id, parent, stagingDirectory string, diffOutput *DriverWithDifferOutput, options *ApplyDiffOpts) error
+	// CleanupStagingDirectory cleanups the staging directory.  It can be used to cleanup the staging directory on errors
+	CleanupStagingDirectory(stagingDirectory string) error
+	// DifferTarget gets the location where files are stored for the layer.
+	DifferTarget(id string) (string, error)
+}
+
 // Capabilities defines a list of capabilities a driver may implement.
 // These capabilities are not required; however, they do determine how a
 // graphdriver can be used.
@@ -193,6 +230,9 @@ type AdditionalLayer interface {
 	// Info returns arbitrary information stored along with this layer (i.e. `info` file)
 	Info() (io.ReadCloser, error)
 
+	// Blob returns a reader of the raw contents of this layer.
+	Blob() (io.ReadCloser, error)
+
 	// Release tells the additional layer store that we don't use this handler.
 	Release()
 }
@@ -206,6 +246,10 @@ type AdditionalLayerStoreDriver interface {
 	// LookupAdditionalLayer looks up additional layer store by the specified
 	// digest and ref and returns an object representing that layer.
 	LookupAdditionalLayer(d digest.Digest, ref string) (AdditionalLayer, error)
+
+	// LookupAdditionalLayer looks up additional layer store by the specified
+	// ID and returns an object representing that layer.
+	LookupAdditionalLayerByID(id string) (AdditionalLayer, error)
 }
 
 // DiffGetterDriver is the interface for layered file system drivers that
@@ -238,7 +282,7 @@ func init() {
 // Register registers an InitFunc for the driver.
 func Register(name string, initFunc InitFunc) error {
 	if _, exists := drivers[name]; exists {
-		return fmt.Errorf("Name already registered %s", name)
+		return fmt.Errorf("name already registered %s", name)
 	}
 	drivers[name] = initFunc
 
@@ -252,7 +296,7 @@ func GetDriver(name string, config Options) (Driver, error) {
 	}
 
 	logrus.Errorf("Failed to GetDriver graph %s %s", name, config.Root)
-	return nil, errors.Wrapf(ErrNotSupported, "failed to GetDriver graph %s %s", name, config.Root)
+	return nil, fmt.Errorf("failed to GetDriver graph %s %s: %w", name, config.Root, ErrNotSupported)
 }
 
 // getBuiltinDriver initializes and returns the registered driver, but does not try to load from plugins
@@ -261,7 +305,7 @@ func getBuiltinDriver(name, home string, options Options) (Driver, error) {
 		return initFunc(filepath.Join(home, name), options)
 	}
 	logrus.Errorf("Failed to built-in GetDriver graph %s %s", name, home)
-	return nil, errors.Wrapf(ErrNotSupported, "failed to built-in GetDriver graph %s %s", name, home)
+	return nil, fmt.Errorf("failed to built-in GetDriver graph %s %s: %w", name, home, ErrNotSupported)
 }
 
 // Options is used to initialize a graphdriver
@@ -340,14 +384,13 @@ func New(name string, config Options) (Driver, error) {
 		}
 		return driver, nil
 	}
-	return nil, fmt.Errorf("No supported storage backend found")
+	return nil, fmt.Errorf("no supported storage backend found")
 }
 
 // isDriverNotSupported returns true if the error initializing
 // the graph driver is a non-supported error.
 func isDriverNotSupported(err error) bool {
-	cause := errors.Cause(err)
-	return cause == ErrNotSupported || cause == ErrPrerequisites || cause == ErrIncompatibleFS
+	return errors.Is(err, ErrNotSupported) || errors.Is(err, ErrPrerequisites) || errors.Is(err, ErrIncompatibleFS)
 }
 
 // scanPriorDrivers returns an un-ordered scan of directories of prior storage drivers
