@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -120,6 +119,9 @@ func aufsWhiteoutPresent(root, path string) (bool, error) {
 func isENOTDIR(err error) bool {
 	if err == nil {
 		return false
+	}
+	if err == syscall.ENOTDIR {
+		return true
 	}
 	if perror, ok := err.(*os.PathError); ok {
 		if errno, ok := perror.Err.(syscall.Errno); ok {
@@ -400,7 +402,7 @@ func ChangesDirs(newDir string, newMappings *idtools.IDMappings, oldDir string, 
 		oldRoot, newRoot *FileInfo
 	)
 	if oldDir == "" {
-		emptyDir, err := ioutil.TempDir("", "empty")
+		emptyDir, err := os.MkdirTemp("", "empty")
 		if err != nil {
 			return nil, err
 		}
